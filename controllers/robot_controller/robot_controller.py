@@ -84,14 +84,18 @@ class RobotController:
             sensor.enable(self.timestep)
             self.distance_sensors.append(sensor)
         
-        # Communication
+        # Communication (channel 2: send to supervisor, channel 1: receive from supervisor)
         self.emitter = self.robot.getDevice('emitter')
+        self.emitter.setChannel(2)
         self.receiver = self.robot.getDevice('receiver')
+        self.receiver.setChannel(1)
         self.receiver.enable(self.timestep)
         
         # State variables
         self.state = STATE_FORAGING
-        self.current_patch = self.robot_id % NUM_PATCHES  # Initial assignment
+        self.previous_state = STATE_FORAGING
+        robots_per_patch = max(1, NUM_ROBOTS // NUM_PATCHES)
+        self.current_patch = min(self.robot_id // robots_per_patch, NUM_PATCHES - 1)  # Initial assignment
         self.target_patch = self.current_patch
         self.trash_collected = 0
         self.max_capacity = 10
@@ -99,6 +103,10 @@ class RobotController:
         # Game-theoretic variables
         self.q = [0.0] * NUM_PATCHES  # Trash volumes (received from supervisor)
         self.x = [0.25] * NUM_PATCHES  # Robot distribution
+        self.W = [0.5, 0.5, 0.5, 0.5]  # Growth rates
+        self.nu = 0.0                  # Payoff parameter
+        self.active_robots = NUM_ROBOTS # Fleet health / active count
+        self.patch_trash_coords = [[] for _ in range(NUM_PATCHES)]  # Active trash locations
         self.last_revision_time = 0
         self.next_revision_time = self.sample_poisson_time()
         
@@ -120,15 +128,15 @@ class RobotController:
     
     def payoff(self, patch_idx):
         """Payoff mechanism from Equation (6)"""
-        if NU == 0:
+        if self.nu == 0:
             # Model-free: payoff is just trash volume
             return self.q[patch_idx]
         else:
             # Model-based
             gamma_star = max(self.q)
             return (self.q[patch_idx] + 
-                   NU * (-self.consumption_rate(gamma_star, self.x[patch_idx], patch_idx) + 
-                         W[patch_idx]))
+                   self.nu * (-self.consumption_rate(gamma_star, self.x[patch_idx], patch_idx) + 
+                         self.W[patch_idx]))
     
     def revision_protocol(self):
         """Task revision protocol from Equation (7)"""
@@ -138,67 +146,80 @@ class RobotController:
         # Current patch payoff
         current_payoff = payoffs[self.current_patch]
         
+        # Scale RHO adaptively when trash volumes are low so allocation responds actively
+        max_payoff = max(payoffs)
+        scale = 1.0 if max_payoff > 50 else (10.0 if max_payoff > 10 else 50.0)
+        effective_rho = RHO * scale
+        
         # Calculate switching probabilities
         switch_probs = []
         for i in range(NUM_PATCHES):
             if i == self.current_patch:
-                switch_probs.append(0)
+                switch_probs.append(0.0)
             else:
                 diff = payoffs[i] - current_payoff
-                switch_probs.append(RHO * max(0, diff))
+                switch_probs.append(effective_rho * max(0.0, diff))
         
-        # Normalize probabilities
         total = sum(switch_probs)
-        if total > 0:
-            switch_probs = [p / total for p in switch_probs]
+        if total <= 0:
+            return self.current_patch
         
-        # Stay probability
-        stay_prob = 1 - sum(switch_probs)
+        # Cap total switching probability at 0.8
+        if total > 0.8:
+            switch_probs = [p * 0.8 / total for p in switch_probs]
+            total = 0.8
         
-        # Make decision
+        # Make decision based on cumulative probabilities
         rand = random.random()
-        cumulative = 0
+        cumulative = 0.0
         
         for i in range(NUM_PATCHES):
             if i != self.current_patch:
                 cumulative += switch_probs[i]
                 if rand < cumulative:
                     # Switch to patch i
-                    print(f"Robot {self.robot_id}: Switching from patch {self.current_patch} to {i}")
-                    print(f"  Payoffs: {[f'{p:.2f}' for p in payoffs]}")
+                    print(f"Robot {self.robot_id}: Switching from patch {self.current_patch} to {i}", flush=True)
+                    print(f"  Payoffs: {[f'{p:.2f}' for p in payoffs]}", flush=True)
                     return i
         
         # Stay in current patch
         return self.current_patch
     
     def receive_state_info(self):
-        """Receive q and x from supervisor"""
+        """Receive state, experiment parameters, and active trash positions from supervisor"""
         while self.receiver.getQueueLength() > 0:
             try:
-                # Use getFloats() - This is the cleanest way for float-only messages
-                # It handles the underlying byte-to-float conversion correctly.
                 floats = self.receiver.getFloats()
-                
-                if len(floats) == 9:
-                    # First 4 are q values
+                if len(floats) >= 9:
                     self.q = list(floats[0:4])
-                    # Next 4 are x values
                     self.x = list(floats[4:8])
-                    # Last one is time (we can ignore)
-                else:
-                    if not hasattr(self, '_warned_size'):
-                        # This warning likely comes from the supervisor's 'iif' status message 
-                        # being incorrectly picked up by the robot's receiver, 
-                        # which is not a 9-float message.
-                        print(f"Robot {self.robot_id}: Expected 9 floats, got {len(floats)}")
-                        self._warned_size = True
-                    
+                if len(floats) >= 15:
+                    self.W = list(floats[9:13])
+                    self.nu = floats[13]
+                    self.active_robots = int(floats[14])
+                if len(floats) >= 47:
+                    max_trash_per_patch = 4
+                    coords_per_patch = []
+                    for p in range(NUM_PATCHES):
+                        p_trash = []
+                        offset = 15 + p * (max_trash_per_patch * 2)
+                        for k in range(max_trash_per_patch):
+                            tx = floats[offset + 2 * k]
+                            ty = floats[offset + 2 * k + 1]
+                            if tx < 500.0:  # Not padded with 999.0
+                                p_trash.append((tx, ty))
+                        coords_per_patch.append(p_trash)
+                    self.patch_trash_coords = coords_per_patch
             except Exception as e:
-                if not hasattr(self, '_warned'):
-                    print(f"Robot {self.robot_id}: Error: {e}")
-                    self._warned = True
+                pass
             
             self.receiver.nextPacket()
+    
+    def get_current_patch_trash(self):
+        """Get active trash coordinates in current patch"""
+        if hasattr(self, 'patch_trash_coords') and len(self.patch_trash_coords) > self.current_patch:
+            return self.patch_trash_coords[self.current_patch]
+        return []
     
     def send_status(self):
         """Send robot status to supervisor using native floats"""
@@ -206,7 +227,7 @@ class RobotController:
         message_floats = [
             float(self.robot_id), 
             float(self.current_patch), 
-            self.trash_collected
+            float(self.trash_collected)
         ]
         self.emitter.send(message_floats)
     def get_position(self):
@@ -245,27 +266,40 @@ class RobotController:
         return angle_diff
     
     def detect_collision(self):
-        """Check for obstacles using distance sensors"""
-        threshold = 80  # Sensor threshold
-        for sensor in self.distance_sensors:
+        """Check for obstacles using front distance sensors"""
+        threshold = 120  # Front sensor threshold
+        # E-puck distance sensors: ps0 (front right), ps1 (front right 45°), ps6 (front left 45°), ps7 (front left)
+        front_sensors = [self.distance_sensors[0], self.distance_sensors[1],
+                         self.distance_sensors[6], self.distance_sensors[7]]
+        for sensor in front_sensors:
             if sensor.getValue() > threshold:
                 return True
         return False
     
     def move_to_target(self, target, max_speed=6.28):
-        """Simple proportional controller to move to target"""
+        """Move towards target with orientation control"""
         angle_diff = self.angle_to(target)
         
-        # Proportional control
-        angular_speed = 2.0 * angle_diff
-        
-        # Set motor speeds
-        left_speed = max_speed - angular_speed
-        right_speed = max_speed + angular_speed
-        
-        # Clamp speeds
-        left_speed = max(-max_speed, min(max_speed, left_speed))
-        right_speed = max(-max_speed, min(max_speed, right_speed))
+        # If not aligned with target, pivot in place first
+        if abs(angle_diff) > 0.5:
+            turn_speed = 3.5
+            if angle_diff > 0:
+                # Target is to our left -> turn left (CCW)
+                left_speed = -turn_speed
+                right_speed = turn_speed
+            else:
+                # Target is to our right -> turn right (CW)
+                left_speed = turn_speed
+                right_speed = -turn_speed
+        else:
+            # Aligned: drive forward with proportional heading correction
+            angular_speed = 2.5 * angle_diff
+            left_speed = max_speed - angular_speed
+            right_speed = max_speed + angular_speed
+            
+            # Clamp speeds
+            left_speed = max(-max_speed, min(max_speed, left_speed))
+            right_speed = max(-max_speed, min(max_speed, right_speed))
         
         self.left_motor.setVelocity(left_speed)
         self.right_motor.setVelocity(right_speed)
@@ -276,17 +310,35 @@ class RobotController:
         self.right_motor.setVelocity(0)
     
     def collision_avoidance(self):
-        """Simple collision avoidance behavior"""
-        # Get sensor values
+        """Collision avoidance behavior using distance sensors"""
         sensors = [s.getValue() for s in self.distance_sensors]
         
-        # Weighted sum for steering
-        left_obstacle = sensors[0] + sensors[1] + sensors[2]
-        right_obstacle = sensors[5] + sensors[6] + sensors[7]
+        # E-puck distance sensors:
+        # ps0 (front right 10°), ps1 (front right 45°), ps2 (right 90°)
+        # ps5 (left 90°), ps6 (front left 45°), ps7 (front left 10°)
+        right_obstacle = sensors[0] + sensors[1] + sensors[2]
+        left_obstacle = sensors[5] + sensors[6] + sensors[7]
         
-        # Avoid obstacles
-        left_speed = 3.0 - 0.01 * left_obstacle
-        right_speed = 3.0 - 0.01 * right_obstacle
+        # Avoid obstacles with decisive steering
+        if left_obstacle > 150 and right_obstacle > 150:
+            # Front obstacle: turn right
+            left_speed = 3.0
+            right_speed = -3.0
+        elif left_obstacle > right_obstacle:
+            # Obstacle on left: turn right
+            left_speed = 3.0
+            right_speed = -2.0
+        elif right_obstacle > left_obstacle:
+            # Obstacle on right: turn left
+            left_speed = -2.0
+            right_speed = 3.0
+        else:
+            left_speed = 3.0
+            right_speed = -3.0
+        
+        # Clamp speeds to motor limits (-6.28 to 6.28 rad/s)
+        left_speed = max(-6.28, min(6.28, left_speed))
+        right_speed = max(-6.28, min(6.28, right_speed))
         
         self.left_motor.setVelocity(left_speed)
         self.right_motor.setVelocity(right_speed)
@@ -296,12 +348,13 @@ class RobotController:
         current_time = self.robot.getTime() * 1000  # Convert to ms
         
         if current_time >= self.last_revision_time + self.next_revision_time:
-            # Time for revision
-            new_patch = self.revision_protocol()
-            
-            if new_patch != self.current_patch:
-                self.target_patch = new_patch
-                self.state = STATE_TRANSITION
+            # Only revise task if currently foraging (don't interrupt transition or dumping)
+            if self.state == STATE_FORAGING:
+                new_patch = self.revision_protocol()
+                
+                if new_patch != self.current_patch:
+                    self.target_patch = new_patch
+                    self.state = STATE_TRANSITION
             
             # Sample next revision time
             self.last_revision_time = current_time
@@ -309,76 +362,78 @@ class RobotController:
     
     def run(self):
         """Main control loop"""
+        step_count = 0
         while self.robot.step(self.timestep) != -1:
-            # Receive state information
+            step_count += 1
+            
+            # Receive state information from supervisor
             self.receive_state_info()
             
-            # Send status
+            # Send status to supervisor
             self.send_status()
+            
+            # If deactivated (e.g. during robot failure experiment), stop motors and idle
+            if self.robot_id >= self.active_robots:
+                self.stop()
+                continue
             
             # Check for task revision (Poisson clock)
             self.check_revision_time()
             
             # Finite state machine
             if self.state == STATE_FORAGING:
-                # Navigate within current patch
-                patch_center = PATCH_CENTERS[self.current_patch]
+                patch_trash = self.get_current_patch_trash()
                 
-                # Random foraging within patch
-                if random.random() < 0.01:  # Occasionally pick new random point
-                    offset_x = random.uniform(-2, 2)
-                    offset_y = random.uniform(-2, 2)
-                    self.target_position = (patch_center[0] + offset_x, 
-                                          patch_center[1] + offset_y)
+                # If trash exists in current patch, seek the nearest one
+                if len(patch_trash) > 0:
+                    closest_trash = min(patch_trash, key=lambda t: self.distance_to(t))
+                    self.target_position = closest_trash
+                    target_speed = 4.5
+                    
+                    # Track individual pickup when reaching trash
+                    if self.distance_to(closest_trash) < 0.35:
+                        self.trash_collected += 1
+                else:
+                    # No trash in current patch: patrol inside the patch bounds
+                    patch_center = PATCH_CENTERS[self.current_patch]
+                    if self.distance_to(self.target_position) < 0.6 or random.random() < 0.02:
+                        ox = random.uniform(-2.2, 2.2)
+                        oy = random.uniform(-2.2, 2.2)
+                        self.target_position = (patch_center[0] + ox, patch_center[1] + oy)
+                    target_speed = 3.5
                 
-                # Check for collisions
+                # Check for collisions with other robots or arena walls
                 if self.detect_collision():
+                    self.previous_state = self.state
                     self.state = STATE_COLLISION_AVOIDANCE
                     self.collision_avoidance_time = self.robot.getTime()
                 else:
-                    self.move_to_target(self.target_position, max_speed=4.0)
-                
-                # Check if trash basket is full
-                if self.trash_collected >= self.max_capacity:
-                    self.state = STATE_DUMP
-                    # Find nearest dumpster
-                    nearest_dumpster = min(DUMPSTERS, 
-                                         key=lambda d: self.distance_to(d))
-                    self.target_position = nearest_dumpster
+                    self.move_to_target(self.target_position, max_speed=target_speed)
             
             elif self.state == STATE_COLLISION_AVOIDANCE:
                 self.collision_avoidance()
                 
-                # Return to foraging after 1 second
-                if self.robot.getTime() - self.collision_avoidance_time > 1.0:
-                    self.state = STATE_FORAGING
+                # Return to previous state after 0.5 seconds
+                if self.robot.getTime() - self.collision_avoidance_time > 0.5:
+                    self.state = self.previous_state
             
             elif self.state == STATE_TRANSITION:
-                # Transition to new patch
+                # Transition across the arena to new patch
                 target_patch_center = PATCH_CENTERS[self.target_patch]
-                self.move_to_target(target_patch_center, max_speed=6.0)
                 
-                # Check if reached target patch
-                if self.distance_to(target_patch_center) < 1.0:
+                # Check if arrived at target patch (within 2.0m of patch center)
+                if self.distance_to(target_patch_center) < 2.0:
                     self.current_patch = self.target_patch
+                    self.target_position = target_patch_center
                     self.state = STATE_FORAGING
-                    print(f"Robot {self.robot_id}: Arrived at patch {self.current_patch}")
-                
+                    print(f"Robot {self.robot_id}: Arrived at patch {self.current_patch}", flush=True)
                 # Collision avoidance during transition
-                if self.detect_collision():
+                elif self.detect_collision():
+                    self.previous_state = self.state
                     self.state = STATE_COLLISION_AVOIDANCE
                     self.collision_avoidance_time = self.robot.getTime()
-            
-            elif self.state == STATE_DUMP:
-                # Navigate to dumpster
-                self.move_to_target(self.target_position, max_speed=5.0)
-                
-                # Check if reached dumpster
-                if self.distance_to(self.target_position) < 0.5:
-                    # Empty trash
-                    self.trash_collected = 0
-                    self.state = STATE_FORAGING
-                    print(f"Robot {self.robot_id}: Emptied trash at dumpster")
+                else:
+                    self.move_to_target(target_patch_center, max_speed=5.5)
 
 if __name__ == "__main__":
     controller = RobotController()

@@ -11,7 +11,8 @@ WorldInfo {
     "Based on Park, Zhong, Leonard (ICRA 2021)"
   ]
   title "Game-Theoretic Task Allocation"
-  basicTimeStep 16
+  basicTimeStep 32
+  optimalThreadCount 8
   contactProperties [
     ContactProperties {
       material1 "trash"

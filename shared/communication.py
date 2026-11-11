@@ -3,7 +3,7 @@ Communication protocols between robots and supervisor
 """
 import json
 import struct
-from typing import Dict, Any
+from typing import Dict, Any, List, Tuple
 from shared.constants import MessageType
 
 class Message:
